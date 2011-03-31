@@ -1,0 +1,323 @@
+package Term::GetInput;
+
+require Exporter;
+
+#add this line in when it all works
+#use Carp;
+use Term::ReadKey;
+
+@ISA = qw(Exporter, AutoLoader);
+@EXPORT = don't know
+
+%SingleKeys = (
+	"\cR" => RedrawLine,		# ^R should redraw the input line
+	"\cL" => RedrawLine,		# as does ^L
+	"\cW" => EraseWord,			# ^W erases the preceding word
+	"\t" => TabCompletion,		# TAB tab-completion on cursor-word
+	"\0211" => RevTabCompletion,	# Meta-Tab (Sun kbd) reverse-tab completion
+	"\cH" => BackSpace,			# ^H does backspace
+	"\0177" => DeleteChar,		# ^? does delete
+	"\cD" => DeleteChar,		# ^D will delchar too
+	"\e" => MultiKey,			# a key possibly generating more than one byte
+);
+
+%MultiKeys = (		# the leading ESC was already received
+	"[D" => LeftArrow,		# move cursor left
+	"[C" => RightArrow,		# move right
+	"[A" => UpArrow,			# most recent history cmd
+	"[B" => DownArrow,		# next history cmd
+	"[2~" => Insert,		# toggle insert mode
+);
+
+# exported variables
+$ValidKeys = '';		# regexp that matches the valid keys.  Set by Init.
+$Echo = 1;				# echo defaults to on
+$HistSize = 50;			# max number of lines in the history
+
+# non-exported variables
+@LineStack = ();		# for accumulating '\'-terminated lines
+$InputLine = '';		# what we've got so far
+$CurPos = 0;			# current cursor offset into $InputLine (0-based)
+%History = ();			# hash to hold history lines
+$HistNext = 1;			# offset of next history command
+%TermInfo = ();			# terminfo codes for this terminal
+
+
+# Function:
+#	BEGIN
+# Params:
+#	None
+# Returns:
+#	Nothing
+# Purpose:
+#	Called while this package is loaded.  Grabs necessary information from
+#	the terminfo for $ENV{'TERM'} and puts it in a nice hash for us to
+#	use.
+sub BEGIN
+{
+	print "Grokking your terminal...";
+
+	CHANGE:
+	- need codes for cursor movement, mostly
+
+	print "\nOkay, let's roll.\n";
+}	# BEGIN
+
+# Function:
+#	ProcessHistory
+# Params:
+#	$_[0]		line to do history processing on
+# Returns:
+#	0			no history processing done
+#	1			history processing was done
+# Purpose:
+#	Do history processing on $_[0].  Set $_[0] to be the modified line upon
+#	return.  All history directives begin with a '!'.
+#	'!<n>' will be replaced with the text in the nth slot in the history list.
+#	'!<word>' will be replaced with the most recent text that began with <word>.
+#	'!{<text>}' will be replaced with the most recent text that began with <text>
+#	(this syntax allows embedded whitespace to be matched).
+#	'!!' will be replaced with the most recent command.
+#	Directives can occur anywhere within a line and cannot be nested.
+#	To prevent a '!' from starting a directive, prepend a '\' to it.  Upon
+#	return, the '\' will be removed.  Note that '\'-removal alone will
+#	return 0.
+sub ProcessHistory
+{
+	my $ret = 0;
+
+	# find bangs that aren't escaped
+	while ($_[0] =~ s/(^|[^\\])(!(!|{.*?}|\d+|\S+))//)
+	{
+		my $pre = $`.$1;
+		my $post = $';
+		my $stuff = $2;
+		my $sub = '';
+
+		$ret = 1;
+
+		# kill any braces on our bang stuff
+		$stuff = substr($stuff, 1, -1) if ($stuff =~ /^{.*}$/);
+
+		# doubled bang
+		if ($stuff eq '!!')
+		{
+			$sub = ($HistNext - 1 < 1) ? $History{$HistSize} : $history{$HistNext - 1};
+		}
+		# bang followed by only digits
+		elsif ($stuff =~ /!\d+/)
+		{
+			$sub = $history{$stuff};
+		}
+		# bang followed by stuff
+		else
+		{
+			# compare $stuff to the start of each line in the history and
+			# use the one that matches the most recent line
+
+			my $i = $HistNext - 1;
+			my $j = 1;
+
+			while ($j <= $histsize)
+			{
+				$i--;
+				$i = $histsize if ($i < 1);
+				last if ($history{$i} =~ /^$stuff/);
+				$j++;
+			}
+
+			$sub = $history{$i};
+		}
+
+		# put in the replacement text
+		$_[0] = $pre.$sub.$post;
+	}	# while
+	
+	# unescape all escaped bangs.  Note that we don't worry about escaped
+	# escapes, since we pass escapes through unprocessed, except on bang
+	# characters.
+	$_[0] =~ s.\\!.!.g;
+
+	return $ret;
+}	# ProcessHistory
+
+# Function:
+#	AddToHistory
+# Params:
+#	$_[0]		line to add to history
+# Returns:
+#	Nothing
+# Purpose:
+#	Add the parameter to the end of the history list.  Wrap the list if
+#	necessary.
+sub AddToHistory
+{
+	my $temp = $_[0];
+
+	chomp($temp);
+	
+	if ($temp ne '')
+	{
+		# yes, we use a hash since it makes it much easier to do bash-like
+		# history stuff.  This means that if a line is in history slot
+		# #5, it will remain in #5 until it goes off the end of the list.
+		$History{$HistNext} = $temp;
+		$HistNext++;
+
+		$HistNext = 1 if ($HistNext > $HistSize);		# wrap around if full
+	}
+
+	return '';
+}	# AddToHistory
+
+# Function:
+#	GetInput
+# Params:
+# Returns:
+# Purpose:
+#	If a character is waiting on stdin, reads it and uses it to process
+#	the current input line.  Returns undef if a complete string was not
+#	present, or the current input line as a result of a newline
+#	character having been received.  The newline is added to the string
+#	and the current input line is emptied.  All keys are checked
+#	against the valid-key regexp, and only those that match are used in
+#	the input line:  others will sound the terminal bell.  If the last
+#	character before the newline on a line is a '\', all lines up to
+#	and including the next non-'\'-terminated line will be concatenated
+#	to the current input line (i.e. you can break up lines putting a
+#	'\' at the end of them).  Lines are added to the history list as
+#	well.
+sub GetInput
+{
+	my($key, $i, $ret) = ('', '', '');
+
+	if (($key = ReadKey(-1)) ne '' && $key ne "\000")
+	KEYCHECK:
+	{
+		# newline or carriage-return means we're done a line
+		if ($key eq "\n")
+		{
+			# if line ends in '\', save it
+			if (substr($InputLine, -1, 1) eq '\')
+			{
+				push(@LineStack, $InputLine);
+				$CurPos = 0;
+				$InputLine = '';
+				$ret = '';
+			}
+			else
+			# otherwise it's ready
+			{
+				# if we have lines on the stack, pull them off
+				my $line = '';
+
+				while ($LineStack[0] ne '')
+				{
+					$line .= chop(shift(@LineStack));	# kill backslash
+				}
+
+				# tack on the last line
+				$line .= $InputLine;
+
+				# do history processing on line
+				ProcessHistory($InputLine);
+
+				# add line to history
+				AddToHistory($InputLine);
+
+				$ret = $InputLine."\n";
+
+				# reset input
+				$InputLine = '';
+				$CurPos = 0;
+				@LineStack = ();
+			}
+		}
+		else
+		{
+			# check special keys
+			foreach $i (keys(%SingleKeys))
+			{
+				if ($key eq $i)
+				{
+					my $tmp;
+
+					# call the correct function
+					eval "$tmp = %SingleKeys{$i};";
+					last KEYCHECK;
+				}
+			}
+
+			$InputLine .= $key;
+		}
+
+		# non-special key, so just display it if it's valid
+		print $key if ($Echo && $key =~ /$ValidKeys/);
+	}	# if
+
+	return $ret;
+}	# GetInput
+
+# Function:
+#	RedrawLine
+# Params:
+#	None
+# Returns:
+#	Nothing
+# Purpose:
+#	Send a newline and redraw the input line.  The cursor position within the
+#	line is not changed.
+sub RedrawLine
+{
+	print "\n$InputLine";
+}	# RedrawLine
+
+sub EraseWord
+{
+	my $left = substr($InputLine, 0, $CurPos);
+
+	$left =~ s/\s+$//;		# kill trailing whitespace
+	$left =~ s/^(.*[\s\W_])[\S\w].*$/$1/;		# kill last word
+
+	$InputLine = $left.substr($InputLine, $CurPos);
+}	# EraseWord
+
+sub TabCompletion
+{
+}	# TabCompletion
+
+sub RevTabCompletion
+{
+}	# RevTabCompletion
+
+sub BackSpace
+{
+}	# BackSpace
+
+sub DeleteChar
+{
+}	# DeleteChar
+
+sub MultiKey
+{
+}	# MultiKey
+
+sub LeftArrow
+{
+}	# LeftArrow
+
+sub RightArrow
+{
+}	# RightArrow
+
+sub UpArrow
+{
+}	# UpArrow
+
+sub DownArrow
+{
+}	# DownArrow
+
+sub Insert
+{
+}	# Insert

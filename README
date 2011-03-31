@@ -1,0 +1,5 @@
+A simple MUD client in perl.
+
+I wrote this back in 1998 (you know you're getting old when you have
+"require 'sock.pl'" in there) and have since lost the history of changes to
+the file.  I like to think my perl has come a long way since then.

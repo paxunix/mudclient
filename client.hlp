@@ -1,0 +1,294 @@
+<>
+Multiple commands:
+- a sequence of commands can be performed in succession if they are
+  separated with ';;'.  Examples:
+    #alias dotwo {one;;two}
+  would execute 'one' followed by 'two' when 'dotwo' was typed as a single
+  command.
+
+Line concatenation:
+- Input can span multiple lines if each line is terminated with a
+  backslash.  The lines are spliced together as-is with the backslash
+  and newline removed.  The result is processed as one big line.
+
+History processing:
+- all commands begin with a '!'.  They are only replaced if they occur
+  at the beginning of a command.  They are not nestable.
+- '!!' is replaced with the most recently typed command
+- '!n' is replaced with the nth entry in the history list.  Note that
+  entries maintain their position in the history list until they
+  propogate to the end of the list and are lost (just like in bash).
+- '!{text}' or '!text' is replaced with the most recent command that
+  began with 'text'.  The first syntax lets you include whitespace.
+
+Speedwalking:
+- a concatenation of directions can be given all at once without
+  needing command separators
+- Example:  5e3uwd would send 'e' five times to the server, then three
+  'u' commands to the server, then a 'w' and a 'd'.
+- Note that if your set of possible directions includes
+  multi-character strings, those take precedence.  Example:  if 'ne'
+  is a valid direction, the string '5neuw' would walk you 5
+  'north-east's and then 'up' and 'west'.
+- The set of possible directions is stored in the 'directions'
+  variable.  The directions must be separated by whitespace and longer
+  directions must come before shorter ones.  There is no default set.
+
+Escaped characters:
+- any characters immediately preceded by a '\' are unprocessed and
+  retain the prepended '\'
+- the only exception are braces.  Any top-level braces that are
+  escaped will be unescaped when the command containing them is
+  parsed.
+- typically, if the brace you are using does not have a match
+  occurring later in the command, escape it.
+
+For a list of commands, type "#help all".
+</>
+
+<all>
+Valid builtin commands are:         Aliases for compatibility:
+    #action                             #n
+    #alias                              #mark
+    #evaluate                           #map
+    #help                               #unmap
+    #history                            #path
+    #killall                            #savepath
+    #log                                #cr
+    #loop                               #if
+    #math
+    #nop
+    #substitute
+    #textin
+    #toggle
+    #unaction
+    #unalias
+    #unsubstitute
+    #unvariable
+    #variable
+
+Typing #help <command> will display the help text for that command.
+</all>
+
+<action>
+Syntax:  #action [[{]<regexp>[}] [{]<stuff>[}]]
+
+When the server sends a line matching <regexp>, <stuff> will be
+executed as though you had typed it.  #action with no parameters
+will display a list of current actions.  When a match is found in text
+from the server, all regular expression groupings in <regexp> will be
+assigned to the appropriate variables ($$1 will get the value of the
+first grouping, $$2 the value of the second, etc.).  Once this is
+done, any variables are interpolated and <stuff> is executed.
+The <regexp> comparison is case-sensitive.  Substitutions are done
+before actions on text from the server, meaning you can do actions on
+text you have substituted.
+</action>
+
+<alias>
+Syntax:  #alias [[{]<regexp>[}] [{]<stuff>[}]]
+
+When a command matching <regexp> is given, <stuff> will be executed as
+though you had typed it.  #alias with no parameters will display
+a list of current actions.  When a match is found on text you have
+entered, all regular expression groupings in <regexp> will be assigned
+to the appropriate variables ($$1 will get the value of the first
+grouping, $$2 the value of the second, etc.).  Once this is done, any
+variables are interpolated and <stuff> is executed.  The
+<regexp> comparison is case-insensitive.  All <regexp>'s are
+automatically anchored to match a complete line.  Note that it is also
+possible for you to define client commands by beginning the alias with
+the '#' typically used only for builtin commands.
+</alias>
+
+<toggle>
+Syntax:  #toggle [[{]<var>[}]] [[{]<state>[}]]
+
+Toggles whether or not specific notifications are displayed or
+particular actions taken.  <var> can be:
+    dosubs      -       do substitutions
+    doactions   -       do actions
+    showvar     -       show messages about variables
+    showalias   -       show messages about aliases
+    showaction  -       show messages about actions
+    showsub     -       show messages about substitutions
+    showtog     -       show messages about toggles
+    speedwalk   -       speedwalking capability
+    prettyprint -       pretty-printing of client text
+If no parameter is given, the current state of each toggle is
+displayed.  <state> can be "on" or "off", which enables or disables
+that toggle.  Only enough unique characters have to be specified for
+the first parameter, and all switches matching those characters will
+be toggled.  Parameters are case-insensitive.
+</toggle>
+
+<evaluate>
+Syntax:   #evaluate [{]<expr>[}]
+
+Evaluates <expr> as perl code.  Any variables within <expr> are
+interpolated before execution.  Note that if a brace is required
+within <expr>, it must be immediately preceded by a '\' if the brace
+would cause premature closure of <expr>.  For example, in '#eval
+{print "\}";}', the brace inside the quotes must be quoted, since
+otherwise it would cause the parser to think it had encountered the
+end of the #eval parameter.  Any '\'-quoted braces will be unquoted
+whenever a parameter within braces is given.
+</evaluate>
+
+<help>
+Help:
+Syntax:  #help [[{]<cmd>[}]]
+
+Displays help for the client command <cmd>.  If no parameter is given,
+show a list of client commands.  Typing "#help all" will list the available
+builtin client commands.
+</help>
+
+<history>
+Syntax:  #history
+
+Displays the history list.  Note that commands occupy the same offset
+in the list as long as they are part of the list (just like bash).
+</history>
+
+<log>
+Syntax:  #log [[{]<file>[}]]
+
+Logs the current session to <file>.  All ANSI color codes are filtered
+out before each line is logged.  Prepending a '>' to <file> causes the
+logged lines to be appended to <file> instead of overwritten.  If no
+parameter is given, the current log file is closed and logging is
+stopped.
+</log>
+
+<nop>
+Syntax:  #nop <stuff>
+
+This does nothing.  <stuff> is ignored.
+</nop>
+
+<substitute>
+Syntax:  #substitute [[{]<regexp>[}] [{]<text>[}]]
+
+Any text matching <regexp> received from the server is replaced with
+<text>.  Variable interpolation is done on <regexp> and <text> before
+they are stored in the substitution list.  If no parameters are given,
+the list of current substitutions is given.  Substitutions are done
+before actions on text from the server.
+</substitute>
+
+<textin>
+Syntax:  #textin [{]<file>[}] [[{]<regexp>[}]] [[{]<prefix>[}]]
+
+Reads text from <file> one line at a time, executing each line as
+though you had typed it.  If <regexp> is given, each line is read
+from the file only when a line matching <regexp> is received from the
+server (an attempt to keep people from spamming themselves off with
+long command files).  If <prefix> is given, it is prepended to each
+line read from the file before execution.  If no parameters are given,
+the current #textin is halted.  Whenever a #textin is active, the
+variable 'textin' has the value 'active'.  This variable serves
+no purpose other than to notify you that a #textin is underway.
+</textin>
+
+<unaction>
+Syntax:  #unaction all | <num> ...
+
+If 'all' is given, delete all actions from the list.  Otherwise, a sequence of
+space-separated numbers can be given that represent zero-based offsets into
+the action list (as shown when you type "#action" to get a list of them).
+The action at each given offset is deleted.
+</unaction>
+
+<variable>
+Syntax:  #variable [[{]<name>[}] [{]<value>[}]]
+
+Assigns <value> to a variable called <name>.  <name> can only be
+alphanumeric.  Variables can be referred to in any command by
+$$<name>.  When the command is executed, all occurrences of $$<name>
+are replaced with the value of the variable <name>.  If no parameters
+are given, a list of current variables is shown.  If no <value> is
+given, <name> is removed from the list of variables.
+</variable>
+
+<write>
+Syntax:  #write [{]<file>[}]
+
+Writes out the current toggle state, all actions, aliases,
+substitutions, and variables to <file>.  If <file> is prepended with a
+'>', the data will be appended to <file>.
+</write>
+
+<math>
+Syntax:  #math [{]<var>[}] [{]<expr>[}]
+
+Performs the calculation given in <expr>, interpolating any client
+variables used and stores the result in <var>.  Note that <expr> is
+simply perl code that is evaluated and returns the value put into
+variable <var>.  <var> has any variables interpolated as well.
+</math>
+
+<loop>
+Syntax:  #loop [{]<a>[}] [{]<b>[}] [{]<cmds>[}]
+
+Executes the command <cmds> for each of the values from <a> to <b>
+inclusive.  The loop value is put into the variable '0' each
+time <cmds> is executed.  The loop can be incremental or decremental, but
+always runs from <a> to <b>.
+</loop>
+
+<n>
+Syntax:  #<n> {<expr>}
+
+Executes the command <expr> <n> times.  This command is an alias.
+</n>
+
+<cr>
+Syntax:  #cr
+
+Sends a carriage-return/end-of-line sequence to the server.  Just like
+you had pressed Return or Enter.  This command is an alias.
+</cr>
+
+<mark>
+Syntax:  #mark
+
+Resets the current mapping path (i.e. sets the 'path' variable to nothing).
+This command is an alias.
+</mark>
+
+<map>
+Syntax:  #map [{]<stuff>[}]
+
+Appends <stuff> to the variable 'path' as the next command to be
+executed when the contents of 'path' are given as a command.  This
+command is an alias.
+</map>
+
+<unmap>
+Syntax:  #unmap
+
+Removes the last command from the variable 'path'.  This command
+is an alias.
+</unmap>
+
+<path>
+Syntax:  #path
+
+A fancy way for displaying the contents of the 'path' variable.
+This command is an alias.
+</path>
+
+<savepath>
+Syntax:  #savepath [{]<name>[}]
+
+Saves the prettied-up contents of the 'path' variable in the
+alias <name>.  This command is an alias.
+</savepath>
+
+<if>
+Syntax:  #if (<cond>) [{]<cmds>[}]
+
+Evaluates the perl-construct <cond> and if it returns non-zero, executes
+<cmds>.  This command is an alias.
+</if>

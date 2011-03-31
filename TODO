@@ -1,0 +1,29 @@
+- it only operates in line-mode, which is fine, but it should do some of
+  the line-mode setup during connection negotiation.  See RFC 1184.  Then
+  we can do character echoing (passwords, etc.) properly.  Line-mode-only
+  operation means editor-like things on the remote system will be ugly.
+- should strip out all ESC sequences, not just ANSI color, on logged lines
+- #session to open a connection while in the client
+- should page large amounts of output
+- it should do the telnet protocol too
+- cbreak mode stuff
+	- ReadMode 4 - we have to intercept the control flow terminal characters
+	  since when a ^Z or ^C is received, we have to play with the ReadMode
+	- ^R - redraw current line
+	- ^W - erase last word
+	- Tab - complete prefix under cursor, searching forward.  Works like
+	  in 4DOS...pressing TAB multiple times on a word will cycle through
+	  the possible completions for that word.
+	- Meta-Tab complete prefix under cursor, searching backward
+	- Delete - erase char under cursor
+	- Backspace - erase char to left of cursor
+	- left arrow - move left one character
+	- right arrow - move right one character
+	- up arrow - last history command
+	- down arrow - next history command
+	- Insert - toggle between insertion and overtype mode
+- #redraw toggle to automatically redraw the input line when text arrives from
+  server.
+- would be nice if speedwalking wouldn't spam you off
+- use for/vec instead of while/substr to parse for braces.  See DejaNews,
+  comp.lang.perl.misc, search for "vec" on 04/03/97

@@ -1,0 +1,1572 @@
+#!/usr/bin/perl
+
+# $Id: client,v 1.1 1999/08/10 21:18:18 rsh Exp $
+
+use strict qw(vars subs);
+
+# we want nice terminal I/O handling
+use Term::ReadKey;
+# and cool option processing
+use Getopt::Long;
+
+require 'sock.pl';
+
+# set up variables
+my $termwidth = (GetTerminalSize())[0] - 4;	# for pprint with nice right margin
+my $speedwalking = 0;		# not currently speedwalking
+my $hostname = '';		# from cmd line
+my $service = '';		# from cmd line
+my $helpfile = 'client.hlp';	# pathname for client help file
+my $cmdfile = '';		# command file read on startup (from -f cmdline option)
+my $cmdchar = '#';     # client commands must be immediately preceded by this
+my $cmdsep = ';;';     # separates multiple commands on the same input line
+my $histsize = 50;		# max number of commands in history list
+my $histnext = 1;		# offset into history list of next command
+my %history = ();		# empty history to start
+my %toggles = (
+	dosubs => 1,		# do substitutions
+	doactions => 1,		# do actions
+	showvar => 1,		# show variable creation/deletion msgs
+	showalias => 1,		# show alias creation/deletion msgs
+	showaction => 1,	# show action creation/deletion msgs
+	showsub => 1,		# show substitution creation/deletion msgs
+	showtog => 1,		# show toggle messages
+	speedwalk => 1,		# speedwalking
+	prettyprint => 1,	# pretty printing for long lines from client (lines from
+						# server are printed as-is
+	# to add a new toggle, just stick in the key and it's initial
+	# state (0 or 1).  The just reference it whenever you want the value.
+	);
+my %log = (
+	active => 0, 		# currently logging to file?
+	file => ''		# file we're logging to
+	);
+my %textin = (
+	active => 0,		# currently textin'ing?
+	file => '',		# file we're reading from
+	regexp => '',		# when get stuff matching this, read and do next cmd
+	prefix => ''		# prefix all read string with this before processing
+	);
+my $totline = '';		# the big line resulting from a bunch of '\'-ending lines
+my $sockstatus = '';	# return status of read on socket
+my %variables = ();		# currently no variables
+my %substitutions = ();		# no subs at the moment
+my %actions = ();		# none at the moment
+my %aliases = ();		# none yet
+my $cursession = '';	# currently no open connection
+my @clientcmds = 	# a list of the client commands.  This list is used to
+					# dispatch calls to the functions whose names are
+					# Client<cmdname>(@params).  i.e.  there is a ClientAction
+					# function.
+qw(action alias evaluate help history killall log nop substitute textin
+   toggle unaction unalias unsubstitute unvariable variable write loop math);
+
+
+# Clean shutdown on error
+sub abort
+{
+	die "### Connection closed at host side.\n";
+}	# abort
+
+# Handle signals that could kill us
+sub handler
+{
+	my $sig =  $_[0];
+	print "### Caught SIG$sig--shutting down.\n";
+	exit 1;
+}	# handler
+
+# handle SIGWINCH for when terminal changes size
+sub handlewinch
+{
+	$termwidth = (GetTerminalSize())[0] - 4;
+}	# handlewinch
+
+# Always called at program termination
+sub END
+{
+	ReadMode 0;		# return to normal terminal I/O
+	close TEXTIN if $textin{'active'};
+	close LOGFILE if $log{'active'};
+	sock'close_all();
+	exit 0;
+}	# END
+
+# Takes a single string.  Returns the first whitespace- OR brace-surrounded
+# word and sets its parameter to the remainder of the string.  If the next
+# word begins with a $cmdsep, return nothing and do not modify the params.
+# That means it'll only get words belonging to the current command.
+# If returning a brace-surrounded word, the braces are present.
+#  e.g.
+#       #eval {print "Weelah.\n";};;lastcmd
+#           returns "#eval" and param contains {"print "Weelah.\n";};;lastcmd"
+sub GetWord
+{
+    my $arg;
+    my $word;
+
+	$arg = $_[0];
+    $arg =~ s/^\s+//;      # kill leading whitespace
+    if ($arg eq '')
+    {
+        $_[0] = '';
+        return '';
+    }
+
+    if ($arg =~ /^$cmdsep/o)     # if at a $cmdsep, don't grab anymore words
+    {
+        return '';
+    }
+
+    if ($arg =~ /^{/)   # opening brace?
+    {
+        $word = "{".GetBraceStuff($arg)."}";
+        $_[0] = $arg;
+    }
+    else    # anything else
+    {
+        $arg =~ /(.+?)(\s|$cmdsep|$)(.*)/o;
+        $word = $1;
+        $_[0] = $2.$3;
+    }
+
+    $_[0] =~ s/^\s+(.*)/$1/;	# kill leading whitespace now...yes it has
+								# to be done here AND above
+    $word;
+}   # GetWord
+
+# Takes a single parameter:  string surrounded by braces.  Returns the contents
+# of the braces, and the param passed in holds the remainder of the
+# string (the part without the braces).  Assumes first non-space character
+# in the string is an opening brace.
+# Also unquotes all top-level quoted braces within the first brace set.
+# Throws out leading whitespace.
+# e.g.
+#       {#eval {print "You\}\{ typed ";};;\};;#eval {print "blah.\n";}}
+#   is returned as
+#       #eval {print "You\}\{ typed ";};;};;#eval {print "blah.\n";}
+sub GetBraceStuff
+{
+    my ($arg, $nest, $p) = ($_[0], 1, 1);
+    my $ch;  
+    my $ret = '';
+
+    $arg =~ s/^\s+//;  # kill leading whitespace
+    if ($arg eq '')
+    {
+        $_[0] = '';
+        return '';
+    }
+
+    while (($ch = substr($arg, $p, 1) , $p) < length($arg) && $nest > 0)
+    {
+        if ($ch =~ /{/)
+        {
+            $nest++;
+        }
+        elsif ($ch =~ /}/)
+        {
+            $nest--;
+        }
+        elsif ($ch =~ /\\/)     # quoting next char
+        {
+            my $t = substr($arg, $p+1, 1);  # grab quoted char
+
+            if ($t =~ /{|}/)    # brace?
+            {
+                if ($nest < 2)  # top-level?
+                {
+                    $ret .= $t;     # unquote it
+                    $p += 2;    # go to next true char
+                    next;
+                }
+            }
+
+			# output quote and char
+			$ret .= "\\$t";
+			$p += 2;
+			next;
+        }
+
+        $ret .= $ch;    # tack on the character
+        $p++;
+    }
+
+	# braces didn't match
+    if ($nest > 0)
+    {
+		print "### Unmatched brace error.\n";
+        $_[0] = '';
+        return '';
+    }
+
+    chop $ret;  # kill the brace matching the 1st one on line
+    $_[0] = substr($arg, $p);   # parameter is replaced with remainder of line
+    $ret;
+}   # GetBraceStuff
+
+# Reads the next line from the textin file and processes it.  If the file is
+# is done, close it and reset the textin state variables.  Assumes everything
+# is set up and ready to go for the next read (i.e. file is open, etc.).
+sub DoTextinLine
+{
+    my $tmp = <TEXTIN>;
+
+    if (!defined($tmp))
+    {
+        close TEXTIN;
+
+		# get rid of notification variable now that we're done textin
+		delete $variables{'textin'};
+
+        pprint("### Done reading from \"$textin{'file'}\".\n", '###    ', '###\s*');
+
+        $textin{'active'} = 0;
+		$textin{'file'} = '';
+		$textin{'regexp'} = '';
+		$textin{'prefix'} = '';
+    }
+	else
+	{
+		# just like it was typed, but with any prefix attached
+		DoCommand($textin{'prefix'}.$tmp);
+	}
+}   # DoTextinLine
+
+# Takes a line of text and does any actions that match on the line.
+sub DoActions
+{
+	my $line = $_[0];
+	my $i;
+	my @found;
+
+	foreach $i (sort(keys %actions))
+	{
+		#if ($line =~ /$i/)
+		if (@found = ($line =~ /$i/))
+		{
+			my $j = 0;
+			my @vars = ();
+
+			# transfer positional parameters that matched in the action
+			# into the variables hash.
+			# Note which variables we set as well, so we can pull out
+			# the $cmdseps in them before we do the action.
+			if ($1 ne '')
+			{
+				do
+				{
+					$j++;
+					push(@vars, $j);		# save name of the variable
+					$variables{$j} = ${$j};
+				} until (${$j} eq $+);
+			}
+
+			# remove any $cmdseps from the variables we got to prevent
+			# other people from abusing user's triggers
+			foreach $j (@vars)
+			{
+				$variables{$j} =~ s/$cmdsep//go;
+			}
+
+			# pretend it was a typed command
+			DoCommand($actions{$i});
+		}
+	}	# foreach
+}	# DoActions
+
+# Called whenever data is read from socket.
+# Assumes its only parameter is the string read from the server.
+# Do matching actions and substitutions.
+# Strips out ANSI color sequences before action-matching is performed, so you
+# don't have to put in groupings to match the color codes in your regexps.
+sub FromServer
+{
+    my $line = $_[0];
+    my $pureline = $line;
+    my $i;
+    my $linedead = 0;
+
+    # strip out ANSI color
+    if ($pureline =~ /\033/)
+    {
+        $pureline =~ s/\033\[.*?m//g;
+    }
+
+    # do subs on $line (logged lines are not substituted), unless ignoring them
+	if ($toggles{'dosubs'})
+	{
+		foreach $i (sort(keys %substitutions))
+		{
+			$line =~ s/$i/$substitutions{$i}/g;     # change all matches
+			$linedead = 1 if ($line =~ /^$/);   # empty line now?
+		}
+	}
+
+    # do any actions that match this string, unless ignoring them
+	DoActions($pureline) if ($toggles{'doactions'});
+
+    #display data, unless we substituted it all away
+    print $line unless $linedead;
+
+    # if we're doing a textin, spew out the next command if the regexp matches
+    # what we just got.  If you do not give a regular
+    # expression for the textin cmd, all lines in the file will be shot out
+    # at once (see the polling i/o loop).
+    DoTextinLine() if ($textin{'active'} && $textin{'regexp'} ne '' &&
+					   $line =~ /$textin{'regexp'}/);
+
+    print LOGFILE $pureline if ($log{'active'});  # log the line WITHOUT color
+}   # FromServer
+
+# Take care of variable interpolation.  Variables are denoted by
+# "$$varname", where varname is a collection of digits, numbers, or '_'.
+# If $$varname is a number, it is a position parameter.
+# $$1 signifies the first grouping in a regexp, $$2, the second,
+# etc.  Returns the interpolated line.
+sub DoVariables
+{
+    my $line = $_[0];
+	my $oldline = $line;
+	my @varnames = ();
+	my $var = 0;
+
+	# one the first pass, we create an array of variable names that we
+	# are interpolating.  Then, on the second pass, we replace all of them.
+	# We don't use the s///g regexp operator since that will also interpolate
+	# any variables whose values are the name of a variable.
+	# We don't interpolate variable that refer to variables.
+	while (defined($line) && $line =~ /\$\$(\w+)/)   # for each variable in the line
+	{
+		# replace it with nothing...we're just picking the names out
+		$var = $1;
+		$line =~ s/\$\$$var//g;
+		push(@varnames, $var);
+	}
+
+	# now that we have the names, replace them with values
+	my $i;
+	foreach $i (@varnames)
+	{
+		$oldline =~ s/\$\$$i/$variables{$i}/g;
+	}
+
+    $oldline;      # return the modified line
+}   # DoVariables
+
+# Adds the single parameter to the next position in the history list.
+sub AddToHistory
+{
+	my $temp = $_[0];
+
+	chomp($temp);
+	
+	if ($temp ne '')
+	{
+		$history{$histnext} = $temp;	# use an assoc array
+		$histnext++;
+
+		$histnext = 1 if ($histnext > $histsize);		# wrap around if full
+	}
+}	# AddToHistory
+
+# Takes single param that is assumed to be a single command with no
+# leading or trailing whitespace or $cmdsep's.  If it is
+# a bang-command, replace the bang stuff with the command
+# from the history list, set the param to the modified line, and
+# return 1, else return undef and don't modify the param.
+sub GetHistoryCommand
+{
+	my $line = $_[0];
+
+	# first char must be a bang
+	if ($line =~ /^!/)
+	{
+		# doubled bang means most recent cmd
+		if ($line =~ /^!!/)
+		{
+			# replace the bang stuff with the right command
+			my $temp = ($histnext - 1 < 1) ? $history{$histsize} : $history{$histnext - 1};
+			$_[0] = $temp.substr($line, 2);
+			return 1;
+		}
+		# bang followed by only digits
+		elsif ($line =~ /^!(\d+)/)
+		{
+			$_[0] = $history{$1}.substr($line, 1 + length($1));
+			return 1;
+		}
+		# bang followed by stuff
+		elsif ($line =~ /^!(.+)/)
+		{
+			# compare $1 to the start of each line in the history and
+			# use the one that matches a more recent line
+
+			my $i = $histnext - 1;
+			my $j = 1;
+			my $text = KillBraces($1);
+
+			while ($j <= $histsize)
+			{
+				$i--;
+				$i = $histsize if ($i < 1);
+				last if ($history{$i} =~ /^$text/);
+				$j++;
+			}
+
+			$_[0] = $history{$i}.substr($line, 1 + length($text));
+		}
+		elsif ($line =~ /^!{(.*)}/)
+		# bang with stuff in braces
+		{
+			my $i = $histnext - 1;
+			my $j = 1;
+			my $text = $1;
+
+			while ($j <= $histsize)
+			{
+				$i--;
+				$i = $histsize if ($i < 1);
+				last if ($history{$i} =~ /^$text/);
+				$j++;
+			}
+
+			$_[0] = $history{$i}.substr($line, 3 + length($text));
+		}
+
+		# anything else will go through as a server command
+	}
+	
+	# not a history command
+	return '';
+}	# GetHistoryCommand
+
+# Takes a sequence of two parameters (any more and they are ignored).
+# The first is a regular
+# expression and the second is a command line to execute when the host
+# sends a line matching the regular expression.
+sub ClientAction
+{
+	my $regexp = KillBraces($_[0]);
+	my $cmds = KillBraces($_[1]);
+
+	# add/modify action
+	if ($regexp ne '' && $cmds ne '')
+	{
+		# put into assoc array
+		$actions{$regexp} = $cmds;
+		pprint("### {$regexp} now triggers {$cmds}\n", '###    ', '###\s*') if ($toggles{'showaction'});
+	}
+	elsif ($cmds eq '' && $regexp ne '')
+	# remove one based on the regexp
+	{
+		if (delete($actions{$regexp}) ne '')
+		{
+			pprint("### {$regexp} is no longer an action.\n", '###    ', '###\s*') if ($toggles{'showaction'});
+		}
+		else
+		{
+			pprint("### {$regexp} is not an action.\n", '###    ', '###\s*');
+		}
+	}
+	elsif ($regexp eq '' && $cmds ne '')
+	{
+		print("### You can't have an empty action.\n");
+	}
+	else
+	# display existing actions
+	{
+		print "### You have the following actions:\n".
+			  "###################################\n";
+
+		my $j = 0;
+		my $i;
+
+		foreach $i (sort(keys %actions))
+		{
+			pprint(sprintf("### %3d. {$i} -> {$actions{$i}}\n", $j), '###', '###\s*\d+\.\s*');
+			$j++;
+		}
+
+		print "###################################\n";
+	}
+}	# ClientAction
+
+# Takes two parameters (any more and they're ignored).  The first is a
+# regular expression that (when a match is entered), the second parameter
+# (a sequence of commands) is executed as though the user had typed it
+# instead.  Note that regexp grouping is applied, so that $$1 will refer to
+# the value of the first regexp group, $$2 to the second.
+sub ClientAlias
+{
+	my $regexp = KillBraces($_[0]);
+	my $cmds = KillBraces($_[1]);
+
+	# display existing aliases
+	if ($regexp eq '' && $cmds eq '')
+	{
+		print "### You have the following aliases:\n".
+			  "###################################\n";
+
+		my $j = 0;
+		my $i;
+
+		foreach $i (sort(keys %aliases))
+		{
+			pprint(sprintf("### %3d. {$i} -> {$aliases{$i}}\n", $j), '###', '###\s*\d+\.\s*');
+			$j++;
+		}
+
+		print "###################################\n";
+	}
+	# they refer to the same thing (infinite loop at execution time)
+	# Note that we quote the regexp so that we can compare a regexp to it.
+	# Also note that it's case insensitive cuz that's how aliases are.
+	elsif ($regexp =~ /^\Q$cmds\E$/i)
+	{
+		pprint("### {$regexp} would be aliased to itself.  Don't do that.\n", '###    ', '###\s*');
+	}
+	# add/modify alias
+	elsif ($regexp ne '' && $cmds ne '')
+	{
+		# store in assoc array
+		$aliases{$regexp} = $cmds;
+		pprint("### {$regexp} now aliases {$cmds}\n", '###    ', '###\s*') if ($toggles{'showalias'});
+	}
+	elsif ($regexp ne '' && $cmds eq '')
+	# remove one based on regexp
+	{
+		if (delete($aliases{$regexp}) ne '')
+		{
+			pprint("### {$regexp} is no longer an alias.\n", '###    ', '###\s*') if ($toggles{'showalias'});
+		}
+		else
+		{
+			pprint("### {$regexp} is not an alias.\n", '###    ', '###\s*');
+		}
+	}
+	elsif ($regexp eq '' && $cmds ne '')
+	{
+		print "### You can't have an empty alias.\n";
+	}
+}	# ClientAlias
+
+# Takes two params (any more and they're ignored).  1st param is the toggle
+# key, the second is (optional) "on" or "off".
+sub ClientToggle
+{
+	my $which = KillBraces($_[0]);	
+	my $switch = KillBraces($_[1]);
+
+	# no param, so display toggle status
+	if ($which eq '' && $switch eq '')
+	{
+		my $i;
+
+		print "### Toggle status:\n".
+			  "##################\n";
+
+		foreach $i (sort(keys %toggles))
+		{
+			printf("### %15s : %s\n", $i, $toggles{$i} ? "on" : "off");
+		}
+
+		print "##################\n";
+	}
+	elsif ($which eq '' && $switch ne '')
+	{
+		print "### Toggle which state?\n";
+	}
+	elsif ($which ne '' && $switch eq '')
+	# toggle the state
+	{
+		my $i;
+		my $found = 0;
+
+		foreach $i (sort(keys %toggles))
+		{
+			# valid toggle prefix?
+			if ($i =~ /^$which/i)
+			{
+				$found = 1;
+				$toggles{$i} ^= 1;		# do the toggle
+				
+				if ($toggles{'showtog'})
+				{
+					print "### \"$i\" is now ", $toggles{$i} ? "on.\n" : "off.\n";
+				}
+			}
+		}
+
+		print "### \"$which\" is not a valid toggle.\n" if (!$found);
+	}
+	else
+	{
+		my $i;
+
+		foreach $i (sort(keys %toggles))
+		{
+			# valid toggle?
+			if ($i =~ /^$which/i)
+			{
+				if ($switch =~ /^on$/i)
+				{
+					# use ourselves to do the work by first turning it off then
+					# making us toggle it
+					$toggles{$i} = 0;
+					ClientToggle($i);
+					return;
+				}
+				elsif ($switch =~ /^off$/i)
+				{
+					$toggles{$i} = 1;
+					ClientToggle($i);
+					return;
+				}
+				else
+				{
+					print "### You can only use \"on\" or \"off\".\n";
+					return;
+				}
+			}
+		}
+
+		print "### \"$which\" is not a valid toggle.\n";
+	}
+}	# ClientToggle
+
+# Takes one parameter (any more are ignored).  Evaluates the parameter
+# as though it were perl code.
+sub ClientEvaluate
+{
+	# interpolate any variables
+	my $expr = DoVariables(KillBraces($_[0]));
+
+	eval $expr if ($expr ne '');
+}	# ClientEvaluate
+
+# Takes one parameter (others are ignored) as a client command and displays
+# the help text associated with that command.
+sub ClientHelp
+{
+	# get it in lowercase for comparisons
+	my $cmd = lc(KillBraces($_[0]));
+	my $showing = 0;	# not currently showing a topic
+	my $found = 0;
+
+	$cmd =~ s/^$cmdchar*//;	# kill any leading $cmdchars
+	
+	# parse each line in the help file.  When a line matching ^<$cmd>$
+	# is found, everything up until the line matching ^<\/$cmd>$ is
+	# displayed.  Note that the complete command name is necessary.
+	# matches are case-insensitive.
+	if (open(HELPFILE, "<$helpfile"))
+	{
+		print "##########\n";
+		while (<HELPFILE>)
+		{
+			s/#/$cmdchar/go;		# replace all #'s with the correct cmdchar
+			s/;;/$cmdsep/go;		# replace all ;; with correct cmdsep
+			last if (/^<\/$cmd>$/);		# end of topic
+			print "### $_" if ($showing);
+			$showing = 1 if (/^<$cmd>$/);
+		}
+
+		print "##########\n";
+
+		close HELPFILE;
+	}
+	else
+	{
+		print "### Can't file helpfile \"$helpfile\".\n";
+	}
+}	# ClientHelp
+
+# Takes no parameters (ignores all).  Displays the history list.
+sub ClientHistory
+{
+	my $i = $histnext;
+	my $j = 1;
+	my $s;
+
+	print "### Command history:\n".
+		  "####################\n";
+
+	while ($j <= $histsize)
+	{
+		if ($history{$i} ne '')
+		{
+			$s = sprintf("### %3d  %s\n", $i, $history{$i});
+			pprint($s, '###', '###\s*\d+  ');
+		}
+
+		$i++;
+		$i = 1 if ($i > $histsize);
+		$j++;
+	}
+
+	print "####################\n";
+}	# ClientHistory
+
+# Takes no parameters.  Wipes out all aliases, substitutions, actions, and
+# variables.
+sub ClientKillall
+{
+	undef %variables;
+	undef %actions;
+	undef %aliases;
+	undef %substitutions;
+
+	print "### All actions, aliases, substitutions, and variables deleted.\n";
+}	# ClientKillall
+
+# Takes a single parameter (others are ignored).  It is assumed to be the name
+# of a file to which the session is logged.  A timestamp is first written.
+sub ClientLog
+{
+	my $file = KillBraces($_[0]);
+
+	# if we're logging, shut it off
+	if ($log{'active'})
+	{
+		$log{'active'} = 0;
+		print "### Logging to \"$log{'file'}\" is off.\n";
+		$log{'file'} = '';
+		close LOGFILE;
+
+		# if no file was given and we were logging, don't start a new log,
+		# just return.
+		return if ($file eq '');
+	}
+
+	# log to new file
+	if ($file ne '')
+	{
+		if (!open(LOGFILE, ">$file"))
+		{
+			print "### Can't open \"$file\" for output.\n";
+		}
+		else
+		{
+			print LOGFILE scalar(localtime())."\n";
+			$log{'active'} = 1;
+			$log{'file'} = $file;
+			print "### Logging to \"$log{'file'}\" is on.\n";
+		}
+	}
+	else
+	# no file given and we're not logging
+	{
+		print "### You're not logging anything.\n";
+	}
+}	# ClientLog
+
+sub ClientNop
+{
+	# do nothing
+	;
+}	# ClientNop
+
+# Takes two parameters (others ignored).  The first is a regular expression
+# that, when received from the server, is replaced with the second parameter.
+sub ClientSubstitute
+{
+	# interpolate variables for both params
+	my $regexp = DoVariables(KillBraces($_[0]));
+	my $text = DoVariables(KillBraces($_[1]));
+
+	# print the current list of substitutions
+	if ($regexp eq '' && $text eq '')
+	{
+		print "### You have the following substitutions:\n".
+			  "#########################################\n";
+
+		my $j = 0;
+		my $i;
+
+		foreach $i (sort(keys %substitutions))
+		{
+			pprint(sprintf("### %3d. {$i} -> {$substitutions{$i}}\n", $j), '###', '###\s*\d+\.\s*');
+			$j++;
+		}
+
+		print "#########################################\n";
+	}
+	# substituting same stuff is stupid, so don't do it
+	elsif ($regexp eq $text)
+	{
+		pprint("### $regexp would substitute itself.  Why bother?\n", '###    ', '###\s*');
+	}
+	# add/modify substitution
+	elsif ($regexp ne '')
+	{
+		# store them in an assoc array
+		$substitutions{$regexp} = $text;
+		pprint("### {$regexp} is replaced with {$text}\n", '###    ', '###\s*') if ($toggles{'showsub'});
+	}
+	elsif ($regexp eq '' && $text ne '')
+	{
+		print "### You can't substitute something for nothing.\n";
+	}
+}	# ClientSubstitute
+
+# Takes three params (others ignored).  First param is file to read from,
+# second is the regexp to match, 3rd is prefix.
+sub ClientTextin
+{
+	# the params get interpolated
+	my $file = DoVariables(KillBraces($_[0]));
+	my $regexp = DoVariables(KillBraces($_[1]));
+	my $prefix = DoVariables(KillBraces($_[2]));
+
+	# if already textin'ing, shut it off
+	if ($textin{'active'})
+	{
+		print "### ${cmdchar}textin from $textin{'file'} stopped.\n";
+
+		close TEXTIN;
+        $textin{'active'} = 0;
+		$textin{'file'} = '';
+		$textin{'regexp'} = '';
+		$textin{'prefix'} = '';
+
+		# get rid of notification variable now that we're done textin
+		delete $variables{'textin'};
+	}
+	else
+	{
+		if ($file ne '')
+		{
+			if (!open(TEXTIN, "<$file"))
+			{
+				print "### Can't open \"$file\"for input.\n";
+				return;
+			}
+
+			$textin{'active'} = 1;
+			$textin{'file'} = $file;
+			$textin{'regexp'} = $regexp;
+			$textin{'prefix'} = $prefix;
+
+			# set notification variable to show we're doing a textin
+			$variables{'textin'} = 'active';
+
+			DoTextinLine();		# do one to get started
+		}
+	}
+}	# ClientTextin
+
+# Takes a single params:  offset into the list of # entries, denoting which
+# one to remove.  If param is 'all', remove them all.
+sub ClientUnaction
+{
+	my $which = $_[0];
+	my $i;
+	my $j = 0;
+
+	return if ($which eq '');
+
+	if ($which =~ /^all$/i)
+	{
+		undef %actions;
+		print "### All actions deleted.\n" if ($toggles{'showaction'});
+		return;
+	}
+
+	foreach $i (sort(keys %actions))
+	{
+		if ($which == $j)
+		{
+			pprint("### {$i} is no longer an action.\n", '###    ', '###\s*') if ($toggles{'showaction'});
+			delete $actions{$i};
+			return;
+		}
+
+		$j++;
+	}
+}	# ClientUnaction
+
+# Takes a single params:  offset into the list of # entries, denoting which
+# one to remove.  If param is 'all', remove them all.
+sub ClientUnalias
+{
+	my $which = $_[0];
+	my $i;
+	my $j = 0;
+
+	return if ($which eq '');
+
+	if ($which =~ /^all$/i)
+	{
+		undef %aliases;
+		print "### All aliases deleted.\n" if ($toggles{'showalias'});
+		return;
+	}
+
+	foreach $i (sort(keys %aliases))
+	{
+		if ($which == $j)
+		{
+			pprint("### {$i} is no longer an alias.\n", '###    ', '###\s*') if ($toggles{'showalias'});
+			delete $aliases{$i};
+			return;
+		}
+
+		$j++;
+	}
+}	# ClientUnalias
+
+# Takes a single params:  offset into the list of # entries, denoting which
+# one to remove.  If param is 'all', remove them all.
+sub ClientUnsubstitute
+{
+	my $which = $_[0];
+	my $i;
+	my $j = 0;
+
+	return if ($which eq '');
+
+	if ($which =~ /^all$/i)
+	{
+		undef %substitutions;
+		print "### All substitutions deleted.\n" if ($toggles{'showsub'});
+		return;
+	}
+
+	foreach $i (sort(keys %substitutions))
+	{
+		if ($which == $j)
+		{
+			pprint("### {$i} is no longer a substitution.\n", '###    ', '###\s*') if ($toggles{'showsub'});
+			delete $substitutions{$i};
+			return;
+		}
+
+		$j++;
+	}
+}	# ClientUnsubstitute
+
+# Takes a single params:  offset into the list of # entries, denoting which
+# one to remove.  If param is 'all', remove them all.
+sub ClientUnvariable
+{
+	my $which = $_[0];
+	my $i;
+	my $j = 0;
+
+	return if ($which eq '');
+
+	if ($which =~ /^all$/i)
+	{
+		undef %variables;
+		print "### All variables deleted.\n" if ($toggles{'showvar'});
+		return;
+	}
+
+	foreach $i (sort(keys %variables))
+	{
+		if ($which == $j)
+		{
+			pprint("### {$i} is no longer a variable.\n", '###    ', '###\s*') if ($toggles{'showvar'});
+			delete $variables{$i};
+			return;
+		}
+
+		$j++;
+	}
+}	# ClientUnvariable
+
+# Takes two params (others ignored).  First param is variable name, second
+# is value.
+sub ClientVariable
+{
+	my $name = DoVariables(KillBraces($_[0]));
+	my $value = DoVariables(KillBraces($_[1]));
+
+	# add/modify variable
+	if ($name ne '' && $value ne '')
+	{
+		# store in assoc array
+		$variables{$name} = $value;
+		pprint("### {$name} now has the value {$value}\n", '###    ', '###\s*') if ($toggles{'showvar'});
+	}
+	elsif ($name eq '' && $value eq '')
+	# print list of current variables
+	{
+		print "### You have the following variables:\n".
+			  "#####################################\n";
+	 
+		my $j = 0;
+		my $i;
+
+		foreach $i (sort(keys %variables))
+		{
+			pprint(sprintf("### %3d. {$i} -> {$variables{$i}}\n", $j), '###', '###\s*\d+\.\s*');
+			$j++;
+		}
+
+		print "#####################################\n";
+	}
+	elsif ($value eq '' && $name ne '')
+	# remove variable from hash if it has no value
+	{
+		delete $variables{$name};
+		pprint("### {$name} is no longer a variable.\n", '###    ', '###\s*') if ($toggles{'showvar'});
+	}
+	elsif ($name eq '' && $value ne '')
+	{
+		print "### You can't assign something to nothing.\n";
+	}
+}	# ClientVariable
+
+# Takes one parameter.  It is the name of the file to write stuff to.
+sub ClientWrite
+{
+	# interpolate variables
+	my $file = DoVariables(KillBraces($_[0]));
+
+	if ($file ne '')
+	{
+		if (!open(CMDFILE, ">$file"))
+		{
+			print "### Can't open \"$file\" for output.\n";
+		}
+		else
+		{
+			my $i;
+
+			# write toggle state
+			foreach $i (sort(keys %toggles))
+			{
+				print CMDFILE "${cmdchar}toggle {$i} ", $toggles{$i} ? "on\n" : "off\n";
+			}
+
+			print CMDFILE "${cmdchar}nop -------------------";
+
+			# write actions
+			foreach $i (sort(keys %actions))
+			{
+				print CMDFILE "${cmdchar}action {$i} {$actions{$i}}\n";
+			}
+
+			print CMDFILE "${cmdchar}nop -------------------";
+
+			# write aliases
+			foreach $i (sort(keys %aliases))
+			{
+				print CMDFILE "${cmdchar}alias {$i} {$aliases{$i}}\n";
+			}
+
+			print CMDFILE "${cmdchar}nop -------------------";
+
+			# write substitutions
+			foreach $i (sort(keys %substitutions))
+			{
+				print CMDFILE "${cmdchar}substitute {$i} {$substitutions{$i}}\n";
+			}
+
+			print CMDFILE "${cmdchar}nop -------------------";
+
+			# write variables
+			foreach $i (sort(keys %variables))
+			{
+				# don't write the textin-active variable if it's present
+				if ($i ne 'textin')
+				{
+					print CMDFILE "${cmdchar}variable {$i} {$variables{$i}}\n";
+				}
+			}
+
+			close CMDFILE;
+
+			print "### Client state written to \"$file\".\n";
+		}
+	}
+}	# ClientWrite
+
+sub ClientMath
+{
+	my $var = DoVariables(KillBraces($_[0]));
+	my $expr = DoVariables(KillBraces($_[1]));
+	my $t = eval $expr;
+
+	ClientVariable($var, $t);
+}	# ClientMath
+
+sub ClientLoop
+{
+	my $s = DoVariables(KillBraces($_[0]));
+	my $e = DoVariables(KillBraces($_[1]));
+	# interpolating the cmds is done when they're executed
+	my $cmds = KillBraces($_[2]);
+	my $i;
+
+	# looping incrementally
+	if ($s < $e)
+	{
+		for ($i=$s; $i<=$e; $i++)
+		{
+			$variables{'0'} = $i;
+			DoCommand($cmds);
+		}
+	}
+	else
+	# looping decrementally
+	{
+		for ($i=$s; $i>=$e; $i--)
+		{
+			$variables{'0'} = $i;
+			DoCommand($cmds);
+		}
+	}
+}	# ClientLoop
+
+# Takes a sequence of parameters.  The first is assumed to be the command
+# word (with the leading $cmdchar), the rest the individual parameters.
+# There should be no leading nor trailing whitespace.  Executes the command.
+# Returns 1 if it was a client command, 0 if not (meaning you can have aliases
+# that are user-defined client commands).
+sub DoClientCommand
+{
+	my $cmd = $_[0];
+	my @params = @_;
+	my $i;
+
+	# get rid of command on param list
+	shift @params;
+
+	# kill cmd char
+	$cmd = substr($cmd, 1);
+
+	# loop over list of client commands and call the correct one
+	foreach $i (@clientcmds)
+	{
+		if ($i =~ /^$cmd/i)
+		{
+			# create our function call
+			eval "Client".ucfirst($i)."(\@params);";
+			return 1;
+		}
+	}
+
+	return '';		# wasn't a built-in one
+}	# DoClientCommand
+
+# Takes a sequence of parameters.  The first is assumed to be the command
+# word, the rest the individual parameters.
+# There should be no leading nor trailing whitespace.  If the command word
+# matches any of the alias <regexp>'s, we execute the commands for the first
+# one we match and return.  We have to reassemble the line from the command
+# word and the parameters, since aliases match on an entire line now.
+sub DoAlias
+{
+	# interpolate any variables the user has entered BEFORE we try to match
+	# I think this makes intuitive sense
+	my $cmd = DoVariables(join(' ', @_));
+	my $i;
+	my $j = 0;
+
+	# check if it matches an alias
+	foreach $i (sort(keys %aliases))
+	{
+		# do case-insensitive comparison to each alias
+		if ($cmd =~ /^$i$/i)
+		{
+			# create the variables from the match-groupings
+			if ($1 ne '')
+			{
+				do
+				{
+					$j++;
+					$variables{$j} = ${$j};
+				} until (${$j} eq $+);
+			}
+
+			# pretend the alias contents were typed
+			DoCommand($aliases{$i});
+			return 1;	# found an alias
+		}
+	}
+
+	return 0;	# didn't find an alias
+}	# DoAlias
+
+# Takes two parameters:  the command and the handle on which to send it.
+# Interpolate variables and send it.
+sub DoServerCommand
+{
+	my $session = $_[1];
+
+	if ($session ne '')
+	{
+		print $session (DoVariables($_[0])."\r\n");
+	}
+	else
+	{
+		print "### You need a session first.\n";
+	}
+}	# DoServerCommand
+
+# Takes a string consisting of digits and nsew and queues it for exec'ing
+# as though the user had typed each direction individually.
+# Return 0 if it's not a valid speedwalk, 1 if it was.
+sub DoSpeedWalk
+{
+	my @dirs = ();
+	my $str = $_[0];
+	my $num = 1;	# default number of times to move is 1
+	my $i;
+	my $dir;
+	my $found;
+	my @speedwalk = ();
+
+	# grab set of valid directions from user-def'd variable
+	push(@dirs, $1) while ($variables{'directions'} =~ /(\w+)((\s+)|$)/g);
+
+	# create an array of directions we're moving in
+	while ($str ne '')
+	{
+		# if digits are first, pull them off
+		$num = $1 if ($str =~ s/^(\d+)//);
+
+		# now the first direction is anything in @dirs that makes a complete
+		# match with the start of the string
+		$found = '';
+		foreach $dir (@dirs)
+		{
+			if ($str =~ /^$dir/)
+			{
+				$found = $dir;
+				last;
+			}
+		}
+
+		return 0 if ($found eq '');	# no matches means it's not a speedwalk
+
+		$speedwalking = 1;		# we are now speedwalking
+
+		for ($i=0; $i<$num; $i++)
+		{
+			push(@speedwalk, $found);
+		}
+
+		$str = substr($str, length($found));	# chop off direction we moved in
+		$num = 1;
+	}
+
+	# now do each direction in the array
+	foreach $i (@speedwalk)
+	{
+		DoCommand($i) 
+	}
+
+	return 1;
+}	# DoSpeedWalk
+
+# Takes the input string and processes the first command on it.
+# Returns the input line sans first command.
+sub DoCommand
+{
+	my $origline = '';
+	my $firstcmd = '';		# this holds the verbatim text of the first cmd
+	my $cmd = $_[0];
+	my $nxt = '';
+	my @params = ();
+	my $j = 0;
+
+    # if it's just a newline, output it
+    if ($cmd =~ /^\n$/)
+    {
+        print $cursession "\r\n" if ($cursession ne '');
+        return '';
+    }
+
+	chomp($cmd);
+
+	{
+		$cmd =~ s/^($cmdsep|\s)*//go;  # kill any leading cmdseps and whitespace
+		$origline = $cmd;
+
+		# create a parameter list for the command by pulling off each word
+		# Note that the cmd word is the first element in the array
+		while (($nxt = GetWord($cmd)) ne '')
+		{
+			$params[$j++] = $nxt;
+		}
+
+		# at this point, $cmd holds everything but the first command on the line
+		# so we put the inverse difference between original input line and $cmd
+		# into $firstcmd
+		$firstcmd = substr($origline, 0, length($origline) - length($cmd));
+
+		# do history replacement if it's a bang command, and then redo the
+		# banged-command, since it has changed from what we thought the first
+		# command was.
+		if (GetHistoryCommand($firstcmd))
+		{
+			DoCommand($firstcmd);
+			last;
+		}
+	 
+		# do client commands
+		if ($params[0] =~ /^$cmdchar/o)
+		{
+			# if it's a builtin client command, we're done, otherwise
+			# we'll check the aliases (yes, you can define your own client
+			# commands this way)
+			last if (DoClientCommand(@params));
+		}
+
+		# do a matching alias, if any
+		if (!DoAlias(@params))
+		{
+			# check for speedwalking and do it unless we're already in one
+			if (!$speedwalking && $toggles{'speedwalk'})
+			{
+				if (DoSpeedWalk($firstcmd))
+				{
+					$speedwalking = 0;		# done speedwalking
+					last;
+				}
+			}
+
+			# otherwise, it's a normal command, so pass the original input line
+			DoServerCommand($firstcmd, $cursession);
+		}
+	}
+
+	# return the rest of the input line
+	return $cmd;
+}	# DoCommand
+
+# Processes a string of commands.
+# Assumes only parameter is the string containing command sequence.
+# We pull them off one at a time, so you don't have to quote the command
+# separator if it's inside another command (as long as there are braces
+# around that piece).  Will handle multiple commands on a line, as well
+# as split lines.  This routine is the first one called when an input line
+# is given.
+# Second parameter is the session to which it goes.
+sub UserInput
+{
+    my $line = $_[0];
+	my $session = $_[1];
+
+	# if line is terminated with backslash, concatenate it
+	if ($line =~ s/\\\n$//)
+	{
+		# tack it on to what we have so far
+		$totline = $totline.$line;
+		return;		# incomplete command, so return
+	}
+	else
+	{
+		# if we already have something, this is the last line to tack on
+		if ($totline ne '')
+		{
+			$line = $totline.$line;
+			$totline = '';
+		}
+	}
+
+	# add it to history list
+	AddToHistory($line);
+
+	# execute first command on line until we have none left
+	while ($line ne '')
+	{
+		$line = DoCommand($line);
+	}
+}	# UserInput
+
+# Takes a single parameter:  a string that is enclosed in braces or isn't and
+# returns the stuff inside or the string itself.
+sub KillBraces
+{
+	my $ret = $_[0];
+
+	# only kill braces if both leading and closing braces exist
+	if (defined($ret) && $ret =~ /^{.*}$/)
+	{
+		$ret = substr($ret, 1, -1);
+	}
+
+	return $ret;
+}	# KillBraces
+
+# Takes two parameters:  file handle and timeout in seconds.  Returns
+# undef if nothing was read, data if something was read.
+sub ReadSocket
+{
+	my $handle = $_[0];
+	my $endtime = $_[1];
+	my ($rmask, $nfound, $nread, $buf) = ('', '', '', '');
+
+	$endtime += time();
+
+	while ($endtime >= time())
+	{
+		$rmask = "";
+		vec($rmask, fileno($handle), 1) = 1;
+		($nfound, $rmask) = select($rmask, '', '', $endtime - time());
+		if ($nfound)
+		{
+			$nread = sysread($handle, $buf, 1024);
+			if ($nread > 0)
+			{
+				$buf =~ s/\015\012/\012/g; # combine (CR NL) into NL
+				$buf =~ s/\377(.)//g;		# kill any telnet crap
+				$sockstatus = 'ok';
+				return $buf;
+			}
+			else
+			{
+				$sockstatus = 'eof';
+				return '';
+			}
+		}
+		else
+		{
+			last;
+		}
+	}
+
+	$sockstatus = 'timeout';
+	return '';
+}	# ReadSocket
+
+# Function:		pprint
+# Params:		String to print
+#				Prefix string that is stuck in the indentation.
+#				Regexp defining the region on the first line that will
+#					define the length of the indentation for subsequent lines
+# Returns:		Nothing
+# Purpose:		Print a string such that no lines exceed the maximum line
+#				width and all lines after the first line are indented by
+#				the length of the regexp match on the start of the string.
+sub pprint
+{
+	my $s = $_[0];
+	my $prefix = $_[1];
+	my $regexp = $_[2];
+	my $width = $termwidth;
+	my $lead = '';
+	my $len;
+	my $hasnewline = chomp($s);
+
+	# if not pretty-printing, shoot out whole string
+	if (!$toggles{'prettyprint'})
+	{
+		print $s;
+		print "\n" if ($hasnewline);
+		return;
+	}
+
+	$lead = $1 if ($s =~ /^($regexp)/);		# get our indent
+
+	$lead = $prefix.(" " x (length($lead) - length($prefix)));
+
+	# display the first line
+	print substr($s, 0, $width);
+
+	# if string is longer than one line, massage it
+	if (length($s) > $width)
+	{
+		$len = $width;
+
+		while (1)
+		{
+			# cut off part of string already shown
+			$s = substr($s, $len);
+
+			if ($s ne '')
+			{
+				print "\n";
+				print $lead;
+			}
+			else
+			{
+				last;
+			}
+
+			$len = $width - length($lead);
+			print substr($s, 0, $len);
+		}
+	}
+
+	print "\n" if ($hasnewline);
+}	# pprint
+
+
+###
+# Start point
+###
+
+# unbuffer stdout
+$| = 1;
+ 
+# setup signal handlers
+$SIG{'INT'} = 'handler';
+$SIG{'QUIT'} = 'handler';
+$SIG{'KILL'} = 'handler';
+$SIG{'HUP'} = 'handler';
+$SIG{'PIPE'} = 'handler';
+# in case resize window, we want to know about it for pretty printing
+$SIG{'WINCH'} = 'handlewinch';
+ 
+# use cooked input mode
+ReadMode 1;
+ 
+my $i;
+my $line;
+	
+# do option processing
+GetOptions("f=s", \$cmdfile, "h=s", \$helpfile);
+
+$hostname = $ARGV[0];
+$service = $ARGV[1];
+
+if (!defined($hostname) || !defined($service))
+{
+	my $program = $0;
+
+	$program =~ s%.*/%%;
+	print STDERR "Usage:  $program [-h <helpfile>] [-f <cmdfile] <host> <service>\n".
+				 "  where <helpfile> is the name of the help file,\n".
+				 "  <cmdfile> is the name of the file to ${cmdchar}textin at startup,\n".
+				 "  <host> is the host to connect to,\n".
+				 "  <service> is the port number or service name.\n";
+	exit -1;
+}
+
+print "### Starting session...";
+$cursession = sock'open($hostname, $service) || die $!;
+print "\n### Connected.\n";
+
+# textin the startup file, if any
+ClientTextin($cmdfile) if ($cmdfile ne '');
+
+# start the processing loop:
+while (1)
+{
+	$line = ReadSocket($cursession, 0);
+ 
+	if ($sockstatus eq 'eof')
+	{
+		print "### Connection closed by server.\n";
+		last;
+	}
+
+	# spew out a line of the textin file if there is no
+	# regular expression we're looking for
+	DoTextinLine() if ($textin{'active'} && $textin{'regexp'} eq '');
+ 
+	# handle stuff from the server
+	FromServer($line) if ($line ne '');
+
+	# use ReadKey module to get our input.  Will probably change to
+	# cbreak mode soon since then we can do more fun things.
+	UserInput($line, $cursession) if ($line = ReadLine(-1));
+}	# while connection open
+
+0;
